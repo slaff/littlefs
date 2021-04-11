@@ -3194,6 +3194,16 @@ static lfs_soff_t lfs_file_rawsize(lfs_t *lfs, lfs_file_t *file) {
 
 static lfs_ssize_t lfs_file_rawgetattr(lfs_t *lfs, lfs_file_t* file,
         uint8_t type, void *buffer, lfs_size_t size) {
+    // If attribute is registered then retrieve cached value
+    for (unsigned i = 0; i < file->cfg->attr_count; i++) {
+        struct lfs_attr* const attr = &file->cfg->attrs[i];
+        if(type == attr->type) {
+            LFS_ASSERT(size <= attr->size);
+            memcpy(buffer, attr->buffer, size);
+            return attr->size;
+        }
+    }
+
     lfs_stag_t tag = lfs_dir_get(lfs, &file->m, LFS_MKTAG(0x7ff, 0x3ff, 0),
             LFS_MKTAG(LFS_TYPE_USERATTR + type,
                 file->id, lfs_min(size, lfs->attr_max)),
@@ -3215,7 +3225,23 @@ static int lfs_file_rawsetattr(lfs_t *lfs, lfs_file_t* file,
     if (size > lfs->attr_max) {
         return LFS_ERR_NOSPC;
     }
+    LFS_ASSERT((file->flags & LFS_O_WRONLY) == LFS_O_WRONLY);
 
+    // If attribute is registered then set cached value for consistency
+    for (unsigned i = 0; i < file->cfg->attr_count; i++) {
+        struct lfs_attr* const attr = &file->cfg->attrs[i];
+        if(type == attr->type) {
+            LFS_ASSERT(size == attr->size);
+            // Little cost here to check if value is different
+            if(memcmp(attr->buffer, buffer, size) != 0) {
+                memcpy(attr->buffer, buffer, size);
+                file->flags |= LFS_F_DIRTY;
+            }
+            return 0;
+        }
+    }
+
+    // Otherwise commit attribute to storage
     return lfs_dir_commit(lfs, &file->m, LFS_MKATTRS(
             {LFS_MKTAG(LFS_TYPE_USERATTR + type, file->id, size), buffer}));
 }
@@ -3223,6 +3249,15 @@ static int lfs_file_rawsetattr(lfs_t *lfs, lfs_file_t* file,
 
 #ifndef LFS_READONLY
 static int lfs_file_rawremoveattr(lfs_t *lfs, lfs_file_t* file, uint8_t type) {
+    // Cannot remove registered attributes
+    for (unsigned i = 0; i < file->cfg->attr_count; i++) {
+        struct lfs_attr* const attr = &file->cfg->attrs[i];
+        LFS_ASSERT(type != attr->type);
+        if(type == attr->type) {
+            return LFS_ERR_EXIST;
+        }
+    }
+
     return lfs_dir_commit(lfs, &file->m, LFS_MKATTRS(
             {LFS_MKTAG(LFS_TYPE_USERATTR + type, file->id, 0x3ff), NULL}));
 }
