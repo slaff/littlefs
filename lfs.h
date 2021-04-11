@@ -614,6 +614,14 @@ int lfs_file_rewind(lfs_t *lfs, lfs_file_t *file);
 // Returns the size of the file, or a negative error code on failure.
 lfs_soff_t lfs_file_size(lfs_t *lfs, lfs_file_t *file);
 
+lfs_ssize_t lfs_file_getattr(lfs_t *lfs, lfs_file_t* file,
+        uint8_t type, void *buffer, lfs_size_t size);
+
+int lfs_file_setattr(lfs_t *lfs, lfs_file_t* file,
+        uint8_t type, const void *buffer, lfs_size_t size);
+
+int lfs_file_removeattr(lfs_t *lfs, lfs_file_t* file, uint8_t type);
+
 
 /// Directory operations ///
 
