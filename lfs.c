@@ -1176,6 +1176,32 @@ static int lfs_dir_find_match(void *data,
     return LFS_CMP_EQ;
 }
 
+static lfs_stag_t lfs_dir_findat(lfs_t *lfs, lfs_mdir_t *dir,
+        const char *name, uint16_t *id) {
+    if (id) {
+        *id = 0x3ff;
+    }
+
+    // find entry matching name
+    lfs_stag_t tag;
+    size_t namelen = strlen(name);
+    while (true) {
+        tag = lfs_dir_fetchmatch(lfs, dir, dir->tail,
+                LFS_MKTAG(0x780, 0, 0),
+                LFS_MKTAG(LFS_TYPE_NAME, 0, namelen),
+                id,
+                lfs_dir_find_match, &(struct lfs_dir_find_match){
+                    lfs, name, namelen});
+        if (tag != 0) {
+            return tag;
+        }
+
+        if (!dir->split) {
+            return LFS_ERR_NOENT;
+        }
+    }
+}
+
 static lfs_stag_t lfs_dir_find(lfs_t *lfs, lfs_mdir_t *dir,
         const char **path, uint16_t *id) {
     // we reduce path to a single name if we can find it
@@ -1250,25 +1276,9 @@ nextname:
         }
 
         // find entry matching name
-        while (true) {
-            tag = lfs_dir_fetchmatch(lfs, dir, dir->tail,
-                    LFS_MKTAG(0x780, 0, 0),
-                    LFS_MKTAG(LFS_TYPE_NAME, 0, namelen),
-                     // are we last name?
-                    (strchr(name, '/') == NULL) ? id : NULL,
-                    lfs_dir_find_match, &(struct lfs_dir_find_match){
-                        lfs, name, namelen});
-            if (tag < 0) {
-                return tag;
-            }
-
-            if (tag) {
-                break;
-            }
-
-            if (!dir->split) {
-                return LFS_ERR_NOENT;
-            }
+        tag = lfs_dir_findat(lfs, dir, name, (strchr(name, '/') == NULL) ? id : NULL);
+        if(tag < 0) {
+            return tag;
         }
 
         // to next name
@@ -2030,7 +2040,7 @@ compact:
 
 /// Top level directory operations ///
 #ifndef LFS_READONLY
-static int lfs_rawmkdir(lfs_t *lfs, const char *path) {
+static int lfs_rawmkdirat(lfs_t *lfs, lfs_dir_t* parent, const char *path) {
     // deorphan if we haven't yet, needed at most once after poweron
     int err = lfs_fs_forceconsistency(lfs);
     if (err) {
@@ -2040,7 +2050,13 @@ static int lfs_rawmkdir(lfs_t *lfs, const char *path) {
     struct lfs_mlist cwd;
     cwd.next = lfs->mlist;
     uint16_t id;
-    err = lfs_dir_find(lfs, &cwd.m, &path, &id);
+
+    if(parent == NULL) {
+        err = lfs_dir_find(lfs, &cwd.m, &path, &id);
+    } else {
+        cwd.m = parent->m;
+        err = lfs_dir_findat(lfs, &cwd.m, path, &id);
+    }
     if (!(err == LFS_ERR_NOENT && id != 0x3ff)) {
         return (err < 0) ? err : LFS_ERR_EXIST;
     }
@@ -2629,11 +2645,7 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
     LFS_ASSERT((flags & LFS_O_RDONLY) == LFS_O_RDONLY);
 #endif
 
-    // setup simple file details
-    file->cfg = cfg;
-    file->flags = flags;
-
-    // Located any existing file
+    // Locate any existing file
     lfs_stag_t tag = lfs_dir_find(lfs, &file->m, &path, &file->id);
     if (tag < 0 && !(tag == LFS_ERR_NOENT && file->id != 0x3ff)) {
 #ifndef LFS_READONLY
@@ -2642,6 +2654,8 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         return tag;
     }
 
+    file->cfg = cfg;
+    file->flags = flags;
     return lfs_file_initialize(lfs, file, tag, path);
 }
 
@@ -2676,39 +2690,16 @@ static int lfs_file_rawopenat(lfs_t *lfs,
     file->m = dir->m;
     file->id = 0x3ff;
 
-    // find entry matching name
-    int err;
-    lfs_stag_t tag;
-    size_t namelen = strlen(name);
-    while (true) {
-        tag = lfs_dir_fetchmatch(lfs, &file->m, file->m.tail,
-                LFS_MKTAG(0x780, 0, 0),
-                LFS_MKTAG(LFS_TYPE_NAME, 0, namelen),
-                &file->id,
-                lfs_dir_find_match, &(struct lfs_dir_find_match){
-                    lfs, name, namelen});
-        if (tag < 0) {
-            err = tag;
-            goto cleanup;
-        }
-
-        if (tag) {
-            break;
-        }
-
-        if (!file->m.split) {
-            // No entry found
-            break;
-        }
+    // Locate any existing file
+    lfs_stag_t tag = lfs_dir_findat(lfs, &file->m, name, &file->id);
+    if (tag < 0 && !(tag == LFS_ERR_NOENT && file->id != 0x3ff)) {
+#ifndef LFS_READONLY
+        file->flags |= LFS_F_ERRED;
+#endif
+        return tag;
     }
 
     return lfs_file_initialize(lfs, file, tag, name);
-
-cleanup:
-#ifndef LFS_READONLY
-    file->flags |= LFS_F_ERRED;
-#endif
-    return err;
 }
 
 
@@ -3594,11 +3585,52 @@ static lfs_ssize_t lfs_rawgetattr(lfs_t *lfs, const char *path,
     return lfs_tag_size(tag);
 }
 
+static lfs_ssize_t lfs_rawgetattrat(lfs_t *lfs,
+        lfs_dir_t* dir, const char *name,
+        uint8_t type, void *buffer, lfs_size_t size) {
+    lfs_mdir_t cwd = dir->m;
+    lfs_stag_t tag = lfs_dir_findat(lfs, &cwd, name, NULL);
+    if (tag < 0) {
+        return tag;
+    }
+
+    uint16_t id = lfs_tag_id(tag);
+    if (id == 0x3ff) {
+        // special case for root
+        id = 0;
+        int err = lfs_dir_fetch(lfs, &cwd, lfs->root);
+        if (err) {
+            return err;
+        }
+    }
+
+    tag = lfs_dir_get(lfs, &cwd, LFS_MKTAG(0x7ff, 0x3ff, 0),
+            LFS_MKTAG(LFS_TYPE_USERATTR + type,
+                id, lfs_min(size, lfs->attr_max)),
+            buffer);
+    if (tag < 0) {
+        if (tag == LFS_ERR_NOENT) {
+            return LFS_ERR_NOATTR;
+        }
+
+        return tag;
+    }
+
+    return lfs_tag_size(tag);
+}
+
 #ifndef LFS_READONLY
-static int lfs_commitattr(lfs_t *lfs, const char *path,
+static int lfs_commitattrat(lfs_t *lfs,
+        lfs_dir_t* dir, const char *path,
         uint8_t type, const void *buffer, lfs_size_t size) {
     lfs_mdir_t cwd;
-    lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &path, NULL);
+    lfs_stag_t tag;
+    if(dir == NULL) {
+        tag = lfs_dir_find(lfs, &cwd, &path, NULL);
+    } else {
+        cwd = dir->m;
+        tag = lfs_dir_findat(lfs, &cwd, path, NULL);
+    }
     if (tag < 0) {
         return tag;
     }
@@ -3619,19 +3651,21 @@ static int lfs_commitattr(lfs_t *lfs, const char *path,
 #endif
 
 #ifndef LFS_READONLY
-static int lfs_rawsetattr(lfs_t *lfs, const char *path,
+static int lfs_rawsetattrat(lfs_t *lfs,
+        lfs_dir_t* dir, const char *path,
         uint8_t type, const void *buffer, lfs_size_t size) {
     if (size > lfs->attr_max) {
         return LFS_ERR_NOSPC;
     }
 
-    return lfs_commitattr(lfs, path, type, buffer, size);
+    return lfs_commitattrat(lfs, dir, path, type, buffer, size);
 }
 #endif
 
 #ifndef LFS_READONLY
-static int lfs_rawremoveattr(lfs_t *lfs, const char *path, uint8_t type) {
-    return lfs_commitattr(lfs, path, type, NULL, 0x3ff);
+static int lfs_rawremoveattrat(lfs_t *lfs, lfs_dir_t* dir,
+        const char *path, uint8_t type) {
+    return lfs_commitattrat(lfs, dir, path, type, NULL, 0x3ff);
 }
 #endif
 
@@ -5207,6 +5241,22 @@ lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
     return res;
 }
 
+lfs_ssize_t lfs_getattrat(lfs_t *lfs, lfs_dir_t* dir, const char *name,
+        uint8_t type, void *buffer, lfs_size_t size) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_getattrat(%p, %p, \"%s\", %"PRIu8", %p, %"PRIu32")",
+            (void*)lfs, dir, name, type, buffer, size);
+
+    lfs_ssize_t res = lfs_rawgetattrat(lfs, dir, name, type, buffer, size);
+
+    LFS_TRACE("lfs_getattrat -> %"PRId32, res);
+    LFS_UNLOCK(lfs->cfg);
+    return res;
+}
+
 #ifndef LFS_READONLY
 int lfs_setattr(lfs_t *lfs, const char *path,
         uint8_t type, const void *buffer, lfs_size_t size) {
@@ -5217,9 +5267,27 @@ int lfs_setattr(lfs_t *lfs, const char *path,
     LFS_TRACE("lfs_setattr(%p, \"%s\", %"PRIu8", %p, %"PRIu32")",
             (void*)lfs, path, type, buffer, size);
 
-    err = lfs_rawsetattr(lfs, path, type, buffer, size);
+    err = lfs_rawsetattrat(lfs, NULL, path, type, buffer, size);
 
     LFS_TRACE("lfs_setattr -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+#endif
+
+#ifndef LFS_READONLY
+int lfs_setattrat(lfs_t *lfs, lfs_dir_t* dir, const char *name,
+        uint8_t type, const void *buffer, lfs_size_t size) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_setattrat(%p, %p, \"%s\", %"PRIu8", %p, %"PRIu32")",
+            (void*)lfs, dir, name, type, buffer, size);
+
+    err = lfs_rawsetattrat(lfs, dir, name, type, buffer, size);
+
+    LFS_TRACE("lfs_setattrat -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }
@@ -5233,9 +5301,26 @@ int lfs_removeattr(lfs_t *lfs, const char *path, uint8_t type) {
     }
     LFS_TRACE("lfs_removeattr(%p, \"%s\", %"PRIu8")", (void*)lfs, path, type);
 
-    err = lfs_rawremoveattr(lfs, path, type);
+    err = lfs_rawremoveattrat(lfs, NULL, path, type);
 
     LFS_TRACE("lfs_removeattr -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+#endif
+
+#ifndef LFS_READONLY
+int lfs_removeattrat(lfs_t *lfs, lfs_dir_t* dir, const char *name, uint8_t type) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_removeattrat(%p, %p, \"%s\", %"PRIu8")",
+        (void*)lfs, (void*)dir, name, type);
+
+    err = lfs_rawremoveattrat(lfs, dir, name, type);
+
+    LFS_TRACE("lfs_removeattrat -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }
@@ -5504,9 +5589,25 @@ int lfs_mkdir(lfs_t *lfs, const char *path) {
     }
     LFS_TRACE("lfs_mkdir(%p, \"%s\")", (void*)lfs, path);
 
-    err = lfs_rawmkdir(lfs, path);
+    err = lfs_rawmkdirat(lfs, NULL, path);
 
     LFS_TRACE("lfs_mkdir -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+#endif
+
+#ifndef LFS_READONLY
+int lfs_mkdirat(lfs_t *lfs, lfs_dir_t* dir, const char *name) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_mkdirat(%p, %p, \"%s\")", (void*)lfs, (void*)dir, name);
+
+    err = lfs_rawmkdirat(lfs, dir, name);
+
+    LFS_TRACE("lfs_mkdirat -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }

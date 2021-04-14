@@ -516,6 +516,14 @@ int lfs_setattr(lfs_t *lfs, const char *path,
 #endif
 
 #ifndef LFS_READONLY
+// Set custom attributes for item in parent directory
+//
+// Returns a negative error code on failure.
+int lfs_setattrat(lfs_t *lfs, lfs_dir_t* dir, const char *name,
+        uint8_t type, const void *buffer, lfs_size_t size);
+#endif
+
+#ifndef LFS_READONLY
 // Removes a custom attribute
 //
 // If an attribute is not found, nothing happens.
@@ -641,6 +649,13 @@ int lfs_file_removeattr(lfs_t *lfs, lfs_file_t* file, uint8_t type);
 //
 // Returns a negative error code on failure.
 int lfs_mkdir(lfs_t *lfs, const char *path);
+#endif
+
+#ifndef LFS_READONLY
+// Create a directory inside a parent directory
+//
+// Returns a negative error code on failure.
+int lfs_mkdirat(lfs_t *lfs, lfs_dir_t* dir, const char *name);
 #endif
 
 // Open a directory
