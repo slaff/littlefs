@@ -2470,40 +2470,19 @@ static int lfs_ctz_traverse(lfs_t *lfs,
 }
 
 
-/// Top level file operations ///
-static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
-        const char *path, int flags,
-        const struct lfs_file_config *cfg) {
-#ifndef LFS_READONLY
-    // deorphan if we haven't yet, needed at most once after poweron
-    if ((flags & LFS_O_WRONLY) == LFS_O_WRONLY) {
-        int err = lfs_fs_forceconsistency(lfs);
-        if (err) {
-            return err;
-        }
-    }
-#else
-    LFS_ASSERT((flags & LFS_O_RDONLY) == LFS_O_RDONLY);
-#endif
-
-    // setup simple file details
-    int err;
-    file->cfg = cfg;
-    file->flags = flags;
+// Called after directory and any existing file ID has been located
+static int lfs_file_initialize(lfs_t *lfs, lfs_file_t *file,
+        lfs_stag_t tag, const char* name) {
+    // Setup remaining simple file details
     file->pos = 0;
     file->off = 0;
     file->cache.buffer = NULL;
 
-    // allocate entry for file if it doesn't exist
-    lfs_stag_t tag = lfs_dir_find(lfs, &file->m, &path, &file->id);
-    if (tag < 0 && !(tag == LFS_ERR_NOENT && file->id != 0x3ff)) {
-        err = tag;
-        goto cleanup;
-    }
-
     // get id, add to list of mdirs to catch update changes
     file->type = LFS_TYPE_REG;
     lfs_mlist_append(lfs, (struct lfs_mlist *)file);
+
+    int err;
 
 #ifdef LFS_READONLY
     if (tag == LFS_ERR_NOENT) {
@@ -2511,13 +2490,13 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         goto cleanup;
 #else
     if (tag == LFS_ERR_NOENT) {
-        if (!(flags & LFS_O_CREAT)) {
+        if (!(file->flags & LFS_O_CREAT)) {
             err = LFS_ERR_NOENT;
             goto cleanup;
         }
 
         // check that name fits
-        lfs_size_t nlen = strlen(path);
+        lfs_size_t nlen = strlen(name);
         if (nlen > lfs->name_max) {
             err = LFS_ERR_NAMETOOLONG;
             goto cleanup;
@@ -2526,7 +2505,7 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         // get next slot and create entry to remember name
         err = lfs_dir_commit(lfs, &file->m, LFS_MKATTRS(
                 {LFS_MKTAG(LFS_TYPE_CREATE, file->id, 0), NULL},
-                {LFS_MKTAG(LFS_TYPE_REG, file->id, nlen), path},
+                {LFS_MKTAG(LFS_TYPE_REG, file->id, nlen), name},
                 {LFS_MKTAG(LFS_TYPE_INLINESTRUCT, file->id, 0), NULL}));
         if (err) {
             err = LFS_ERR_NAMETOOLONG;
@@ -2534,7 +2513,7 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         }
 
         tag = LFS_MKTAG(LFS_TYPE_INLINESTRUCT, 0, 0);
-    } else if (flags & LFS_O_EXCL) {
+    } else if (file->flags & LFS_O_EXCL) {
         err = LFS_ERR_EXIST;
         goto cleanup;
 #endif
@@ -2542,7 +2521,7 @@ static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
         err = LFS_ERR_ISDIR;
         goto cleanup;
 #ifndef LFS_READONLY
-    } else if (flags & LFS_O_TRUNC) {
+    } else if (file->flags & LFS_O_TRUNC) {
         // truncate if requested
         tag = LFS_MKTAG(LFS_TYPE_INLINESTRUCT, file->id, 0);
         file->flags |= LFS_F_DIRTY;
@@ -2634,12 +2613,104 @@ cleanup:
     return err;
 }
 
+/// Top level file operations ///
+static int lfs_file_rawopencfg(lfs_t *lfs, lfs_file_t *file,
+        const char *path, int flags,
+        const struct lfs_file_config *cfg) {
+#ifndef LFS_READONLY
+    // deorphan if we haven't yet, needed at most once after poweron
+    if ((flags & LFS_O_WRONLY) == LFS_O_WRONLY) {
+        int err = lfs_fs_forceconsistency(lfs);
+        if (err) {
+            return err;
+        }
+    }
+#else
+    LFS_ASSERT((flags & LFS_O_RDONLY) == LFS_O_RDONLY);
+#endif
+
+    // setup simple file details
+    file->cfg = cfg;
+    file->flags = flags;
+
+    // Located any existing file
+    lfs_stag_t tag = lfs_dir_find(lfs, &file->m, &path, &file->id);
+    if (tag < 0 && !(tag == LFS_ERR_NOENT && file->id != 0x3ff)) {
+#ifndef LFS_READONLY
+        file->flags |= LFS_F_ERRED;
+#endif
+        return tag;
+    }
+
+    return lfs_file_initialize(lfs, file, tag, path);
+}
+
+
 static int lfs_file_rawopen(lfs_t *lfs, lfs_file_t *file,
         const char *path, int flags) {
     static const struct lfs_file_config defaults = {0};
     int err = lfs_file_rawopencfg(lfs, file, path, flags, &defaults);
     return err;
 }
+
+
+static int lfs_file_rawopenat(lfs_t *lfs,
+        lfs_dir_t *dir, lfs_file_t *file,
+        const char *name, int flags,
+        const struct lfs_file_config *config) {
+#ifndef LFS_READONLY
+    // deorphan if we haven't yet, needed at most once after poweron
+    if ((flags & LFS_O_WRONLY) == LFS_O_WRONLY) {
+        int err = lfs_fs_forceconsistency(lfs);
+        if (err) {
+            return err;
+        }
+    }
+#else
+    LFS_ASSERT((flags & LFS_O_RDONLY) == LFS_O_RDONLY);
+#endif
+
+    // setup simple file details
+    file->cfg = config;
+    file->flags = flags;
+    file->m = dir->m;
+    file->id = 0x3ff;
+
+    // find entry matching name
+    int err;
+    lfs_stag_t tag;
+    size_t namelen = strlen(name);
+    while (true) {
+        tag = lfs_dir_fetchmatch(lfs, &file->m, file->m.tail,
+                LFS_MKTAG(0x780, 0, 0),
+                LFS_MKTAG(LFS_TYPE_NAME, 0, namelen),
+                &file->id,
+                lfs_dir_find_match, &(struct lfs_dir_find_match){
+                    lfs, name, namelen});
+        if (tag < 0) {
+            err = tag;
+            goto cleanup;
+        }
+
+        if (tag) {
+            break;
+        }
+
+        if (!file->m.split) {
+            // No entry found
+            break;
+        }
+    }
+
+    return lfs_file_initialize(lfs, file, tag, name);
+
+cleanup:
+#ifndef LFS_READONLY
+    file->flags |= LFS_F_ERRED;
+#endif
+    return err;
+}
+
 
 static int lfs_file_rawclose(lfs_t *lfs, lfs_file_t *file) {
 #ifndef LFS_READONLY
@@ -5202,6 +5273,26 @@ int lfs_file_opencfg(lfs_t *lfs, lfs_file_t *file,
     err = lfs_file_rawopencfg(lfs, file, path, flags, cfg);
 
     LFS_TRACE("lfs_file_opencfg -> %d", err);
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+
+int lfs_file_openat(lfs_t *lfs, lfs_dir_t *dir, lfs_file_t *file,
+        const char *name, int flags,
+        const struct lfs_file_config *config) {
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+        return err;
+    }
+    LFS_TRACE("lfs_file_openat(%p, %p, %p, \"%s\", %x, %p {"
+                 ".buffer=%p, .attrs=%p, .attr_count=%"PRIu32"})",
+            (void*)lfs, (void*)dir, (void*)file, name, flags,
+            (void*)cfg, cfg->buffer, (void*)cfg->attrs, cfg->attr_count);
+    LFS_ASSERT(!lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
+
+    err = lfs_file_rawopenat(lfs, dir, file, name, flags, config);
+
+    LFS_TRACE("lfs_file_at -> %d", err);
     LFS_UNLOCK(lfs->cfg);
     return err;
 }

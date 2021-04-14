@@ -550,6 +550,17 @@ int lfs_file_opencfg(lfs_t *lfs, lfs_file_t *file,
         const char *path, int flags,
         const struct lfs_file_config *config);
 
+// Open a file within an existing directory
+//
+// Directory object is obtained via lfs_dir_open().
+// Provided name is the actual name of the file and must not contain any
+// path elements (i.e. separated by '/')
+//
+// Returns a negative error code on failure.
+int lfs_file_openat(lfs_t *lfs, lfs_dir_t *dir, lfs_file_t *file,
+        const char *name, int flags,
+        const struct lfs_file_config *config);
+
 // Close a file
 //
 // Any pending writes are written out to storage as though
